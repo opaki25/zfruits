@@ -1,30 +1,60 @@
-import { env } from 'cloudflare:workers';
-const json = (v: unknown, status=200) => Response.json(v,{status,headers:{'Cache-Control':'no-store'}});
-const admin = (r:Request) => {const allowed=(env as unknown as Record<string,string>).ADMIN_EMAILS; const email=r.headers.get('oai-authenticated-user-email')?.toLowerCase(); return !!email && !!allowed && allowed.split(',').map(s=>s.trim().toLowerCase()).includes(email)};
-export async function GET(r:Request) {
- const db=env.DB!; const s=await db.prepare('SELECT * FROM settings WHERE id=1').first() ?? {available:0,location:'Z-FRUITS shop, campus',hours:'Pick up after booking while stock is available.',open:1};
- if(new URL(r.url).searchParams.has('admin')) {if(!admin(r)) return json({error:'Sign in with the shop owner account. The owner email must be configured before opening the shop.'},403); return json({settings:s,bookings:(await db.prepare('SELECT * FROM bookings ORDER BY created DESC LIMIT 500').all()).results});}
- return json(s);
+import { database, publicDatabase, SetupError, teamUser } from '@/lib/supabase/server';
+import { allowedOrigin, bookingInput } from '@/lib/validation.mjs';
+export const dynamic='force-dynamic';
+export const runtime='nodejs';
+const json=(body:unknown,status=200)=>Response.json(body,{status,headers:{'Cache-Control':'private, no-store','Vary':'Cookie'}});
+const messages:Record<string,string>={
+ unavailable:'These packs are no longer available, or bookings are closed. Please refresh.',
+ booking_conflict:'This booking has already changed. Please refresh before trying again.',
+ stock_changed:'Stock changed while you were editing. Refresh, check the available packs, and save again.',
+ invalid_booking:'Enter a valid name, Ugandan phone number, and 1–50 packs.',
+ invalid_settings:'Enter valid stock and pickup details.',invalid_status:'Choose a valid booking status.',not_found:'Booking not found.'
+};
+function result(data:{error?:string}|null) {
+ if(data?.error) return json({error:messages[data.error]||'The request could not be completed.'},data.error==='not_found'?404:data.error.startsWith('invalid')?400:409);
+ return json(data);
 }
-export async function POST(r:Request) {
- if(r.headers.get('origin') && r.headers.get('origin')!==new URL(r.url).origin) return json({error:'Invalid origin'},403);
- let b:any; try {b=await r.json()} catch {return json({error:'Invalid request'},400)}
- const db=env.DB!;
- if(b.action) {
- if(!admin(r)) return json({error:'Owner access required'},403);
- if(b.action==='settings') {
- if(!Number.isInteger(b.available)||b.available<0||b.available>10000||typeof b.location!=='string'||!b.location.trim()||b.location.length>160||typeof b.hours!=='string'||b.hours.length>160) return json({error:'Enter valid stock and pickup details.'},400);
- await db.prepare('INSERT INTO settings (id,available,location,hours,open) VALUES (1,?,?,?,?) ON CONFLICT(id) DO UPDATE SET available=excluded.available,location=excluded.location,hours=excluded.hours,open=excluded.open').bind(b.available,b.location.trim(),b.hours,b.open?1:0).run();
- } else if(b.action==='collect') {await db.prepare("UPDATE bookings SET status='collected' WHERE id=? AND status='reserved'").bind(b.id).run();}
- else if(b.action==='cancel') {await db.batch([db.prepare("UPDATE settings SET available=available+COALESCE((SELECT quantity FROM bookings WHERE id=? AND status='reserved'),0) WHERE id=1").bind(b.id),db.prepare("UPDATE bookings SET status='cancelled' WHERE id=? AND status='reserved'").bind(b.id)]);} else return json({error:'Unknown action'},400);
- return json({ok:true});
+function failed(error:unknown) {
+ if(error instanceof SetupError) return json({error:'The shop is not ready for bookings yet. Please try again later.'},503);
+ console.error('Shop request failed');
+ return json({error:'Unable to complete the request. Please try again.'},503);
+}
+export async function GET(request:Request) {
+ try {
+ const isAdmin=new URL(request.url).searchParams.has('admin');
+ if(isAdmin&&!await teamUser()) return json({error:'Please sign in with a shop team account.'},401);
+ const db=isAdmin?database():publicDatabase();
+ const {data:settings,error}=await db.from('shop_settings').select('*').eq('id',1).single();
+ if(error) throw error;
+ if(!isAdmin) return json(settings);
+ const {data:bookings,error:bookingError}=await db.from('bookings').select('*').order('created',{ascending:false}).limit(1000);
+ if(bookingError) throw bookingError;
+ return json({settings,bookings});
+ } catch(error) {return failed(error)}
+}
+export async function POST(request:Request) {
+ if(!allowedOrigin(request)) return json({error:'Invalid origin.'},403);
+ let body:Record<string,unknown>;
+ try {const parsed=await request.json();if(!parsed||typeof parsed!=='object'||Array.isArray(parsed))throw Error();body=parsed as Record<string,unknown>;} catch {return json({error:'Invalid request.'},400)}
+ try {
+ if(body.action) {
+ if(!await teamUser()) return json({error:'Shop team access required.'},401);
+ const db=database();
+ if(body.action==='settings') {
+ if(!Number.isInteger(body.available)||Number(body.available)<0||Number(body.available)>10000||!Number.isInteger(body.version)
+ ||typeof body.location!=='string'||!body.location.trim()||body.location.length>160||typeof body.hours!=='string'||body.hours.length>160||typeof body.open!=='boolean') return json({error:messages.invalid_settings},400);
+ const {data,error}=await db.rpc('save_shop_settings',{p_available:body.available,p_location:body.location.trim(),p_hours:body.hours,p_open:body.open,p_version:body.version});
+ if(error) throw error;return result(data);
  }
- const name=typeof b.name==='string'?b.name.trim():''; const phone=typeof b.phone==='string'?b.phone.replace(/[\s()-]/g,''):'';
- if(name.length<2||name.length>80||! /^(?:0[237]\d{8}|\+?256[237]\d{8})$/.test(phone)||!Number.isInteger(b.quantity)||b.quantity<1||b.quantity>50||typeof b.id!=='string'||! /^[a-f0-9-]{36}$/.test(b.id)) return json({error:'Enter your name, a valid Ugandan phone number, and 1–50 packs.'},400);
- const existing=await db.prepare('SELECT id,quantity FROM bookings WHERE id=?').bind(b.id).first(); if(existing) return json(existing);
- // A conditional INSERT and stock update run in one serialized transaction.
- try {const results=await db.batch([db.prepare("INSERT INTO bookings (id,name,phone,quantity,status,created) SELECT ?,?,?,?,'reserved',? FROM settings WHERE id=1 AND open=1 AND available>=?").bind(b.id,name,phone,b.quantity,new Date().toISOString(),b.quantity),db.prepare('UPDATE settings SET available=available-? WHERE id=1 AND changes()=1').bind(b.quantity)]);
- if(!results[0].meta.changes) return json({error:'These packs are no longer available, or bookings are closed. Please refresh.'},409);
- return json({id:b.id,quantity:b.quantity});} catch {return json({error:'Booking could not be confirmed. Please retry.'},500)}
+ if((body.action==='collect'||body.action==='cancel')&&typeof body.id==='string'&&/^[0-9a-f-]{36}$/i.test(body.id)) {
+ const {data,error}=await db.rpc('update_booking',{p_id:body.id,p_status:body.action==='collect'?'collected':'cancelled'});
+ if(error) throw error;return result(data);
+ }
+ return json({error:'Unknown action.'},400);
+ }
+ const booking=bookingInput(body);
+ if(!booking) return json({error:messages.invalid_booking},400);
+ const {data,error}=await database().rpc('reserve_packs',{p_id:booking.id,p_name:booking.name,p_phone:booking.phone,p_quantity:booking.quantity});
+ if(error) throw error;return result(data);
+ }catch(error){return failed(error)}
 }
-

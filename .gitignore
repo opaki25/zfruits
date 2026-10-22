@@ -46,3 +46,8 @@ yarn-error.log*
 
 package/
 npm.tgz
+
+.vercel/
+supabase/.temp/
+supabase/.branches/
+!.env.example

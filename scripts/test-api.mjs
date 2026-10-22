@@ -1,0 +1,21 @@
+import assert from 'node:assert/strict';
+const base='http://127.0.0.1:5173';
+const sign=await fetch(base+'/signin-with-chatgpt?return_to=/admin',{redirect:'manual'});
+const cookie=sign.headers.get('set-cookie')?.split(';')[0];
+assert.ok(cookie,'Local sign-in cookie');
+async function call(body,authenticated=false){const r=await fetch(base+'/api/shop',{method:'POST',headers:{'Content-Type':'application/json',...(authenticated?{Cookie:cookie}:{})},body:JSON.stringify(body)});return {status:r.status,body:await r.json()}}
+assert.equal((await fetch(base+'/api/shop?admin=1')).status,403);
+assert.equal((await call({action:'settings',available:50,location:'Test pickup',hours:'Test hours',open:1})).status,403);
+assert.equal((await call({action:'settings',available:50,location:'Test pickup',hours:'Test hours',open:1},true)).status,200);
+const ids=Array.from({length:12},()=>crypto.randomUUID());
+const results=await Promise.all(ids.map(id=>call({id,name:'Test Student',phone:'0772123456',quantity:5})));
+assert.equal(results.filter(r=>r.status===200).length,10,'Exactly 50 packs reserved');
+assert.equal(results.filter(r=>r.status===409).length,2,'Overselling rejected');
+assert.equal((await (await fetch(base+'/api/shop')).json()).available,0);
+const accepted=ids[results.findIndex(r=>r.status===200)];
+assert.equal((await call({id:accepted,name:'Test Student',phone:'0772123456',quantity:5})).status,200);
+assert.equal((await (await fetch(base+'/api/shop')).json()).available,0,'Retry does not deduct twice');
+await call({action:'cancel',id:accepted},true);await call({action:'cancel',id:accepted},true);
+assert.equal((await (await fetch(base+'/api/shop')).json()).available,5,'Cancel returns stock once');
+assert.equal((await call({id:crypto.randomUUID(),name:'Test',phone:'bad',quantity:1})).status,400);
+console.log('PASS: authorization, 12 concurrent bookings / 50 packs, oversell protection, retry, cancellation, phone validation');

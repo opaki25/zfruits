@@ -1,0 +1,42 @@
+begin;
+set local role service_role;
+do $$
+declare id1 uuid:=gen_random_uuid(); id2 uuid:=gen_random_uuid(); bid uuid:=gen_random_uuid(); d date:=(now() at time zone 'Africa/Kampala')::date; r jsonb; base bigint; collected bigint;
+begin
+ r:=public.daily_sales(d);base:=(r->>'walkInPacks')::bigint;collected:=(r->>'collectedPacks')::bigint;
+ update public.shop_settings set available=5,open=false where id=1;
+ r:=public.record_shop_sale(id1,d,3,true,'opakijonathan30@gmail.com');
+ assert r->>'ok'='true','Walk-in sale failed while online bookings closed';
+ assert (select available=2 from public.shop_settings where id=1),'Stock deduction failed';
+ perform public.record_shop_sale(id1,d,3,true,'opakijonathan30@gmail.com');
+ assert (select available=2 from public.shop_settings where id=1),'Duplicate stock deduction';
+ r:=public.record_shop_sale(id1,d,4,true,'opakijonathan30@gmail.com');
+ assert r->>'error'='sale_conflict','Changed retry accepted';
+ r:=public.record_shop_sale(gen_random_uuid(),d,3,true,'opakijonathan30@gmail.com');
+ assert r->>'error'='insufficient_stock','Overselling accepted';
+ r:=public.record_shop_sale(gen_random_uuid(),d+1,1,false,'opakijonathan30@gmail.com');
+ assert r->>'error'='invalid_sale','Future sale accepted';
+ r:=public.record_shop_sale(gen_random_uuid(),d,1,false,'outsider@example.com');
+ assert r->>'error'='invalid_sale','Non-team actor accepted';
+ perform public.record_shop_sale(id2,d,4,false,'opakijonathan30@gmail.com');
+ assert (select available=2 from public.shop_settings where id=1),'Already-adjusted stock deducted';
+ r:=public.daily_sales(d);
+ assert (r->>'walkInPacks')::bigint=base+7,'Daily sum wrong';
+ perform public.void_shop_sale(id1);perform public.void_shop_sale(id1);
+ assert (select available=5 from public.shop_settings where id=1),'Void restored twice';
+ perform public.void_shop_sale(id2);
+ assert (select available=5 from public.shop_settings where id=1),'No-stock void changed stock';
+ r:=public.daily_sales(d);assert (r->>'walkInPacks')::bigint=base,'Voided sale included';
+ update public.shop_settings set open=true where id=1;
+ perform public.reserve_packs(bid,'Test Student','+256700000001',2);
+ perform public.update_booking(bid,'collected');perform public.update_booking(bid,'collected');
+ r:=public.daily_sales(d);assert (r->>'collectedPacks')::bigint=collected+2,'Collected sale missing or doubled';
+ assert (select available=3 from public.shop_settings where id=1),'Collection deducted again';
+end $$;
+reset role;
+do $$ begin
+ assert not has_table_privilege('anon','public.shop_sales','SELECT'),'Public sales exposed';
+ assert not has_table_privilege('authenticated','public.shop_sales','INSERT'),'Direct sale insertion exposed';
+ assert not has_function_privilege('anon','public.record_shop_sale(uuid,date,integer,boolean,text)','EXECUTE'),'Public RPC exposed';
+end $$;
+rollback;
